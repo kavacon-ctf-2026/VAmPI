@@ -1,4 +1,6 @@
 import re
+import threading
+import time
 import jsonschema
 import jwt
 
@@ -22,7 +24,8 @@ def get_all_users():
 
 
 def debug():
-    return_value = jsonify({'users': User.get_all_users_debug()})
+    # never expose passwords or admin flags: only the public user fields are returned
+    return_value = jsonify({'users': User.get_all_users()})
     return return_value
 
 def me():
@@ -57,16 +60,9 @@ def register_user():
         try:
             # validate the data are in the correct form
             jsonschema.validate(request_data, register_user_schema)
-            if vuln and 'admin' in request_data:  # User is possible to define if she/he wants to be an admin !!
-                if request_data['admin']:
-                    admin = True
-                else:
-                    admin = False
-                user = User(username=request_data['username'], password=request_data['password'],
-                            email=request_data['email'], admin=admin)
-            else:
-                user = User(username=request_data['username'], password=request_data['password'],
-                            email=request_data['email'])
+            # a client-supplied 'admin' flag is ignored: self-registered users are never admins
+            user = User(username=request_data['username'], password=request_data['password'],
+                        email=request_data['email'])
             db.session.add(user)
             db.session.commit()
 
@@ -80,6 +76,28 @@ def register_user():
             return Response(error_message_helper(exc.message), 400, mimetype="application/json")
     else:
         return Response(error_message_helper("User already exists. Please Log in."), 200, mimetype="application/json")
+
+
+# Brute-force protection: failed login attempts are counted per username in a sliding window.
+# Once the limit is exceeded further FAILED attempts get HTTP 429. A correct password is never
+# blocked, and the throttled response carries the same generic message so it cannot be used
+# to enumerate users.
+LOGIN_FAILURE_LIMIT = 5
+LOGIN_FAILURE_WINDOW_SECONDS = 60
+GENERIC_LOGIN_ERROR = "Username or Password Incorrect!"
+_failed_logins = {}
+_failed_logins_lock = threading.Lock()
+
+
+def _register_failed_login(username):
+    """Records a failed attempt and returns True when the caller is over the limit."""
+    now = time.time()
+    key = str(username).lower()
+    with _failed_logins_lock:
+        recent = [t for t in _failed_logins.get(key, []) if now - t < LOGIN_FAILURE_WINDOW_SECONDS]
+        recent.append(now)
+        _failed_logins[key] = recent
+        return len(recent) > LOGIN_FAILURE_LIMIT
 
 
 def login_user():
@@ -98,16 +116,10 @@ def login_user():
                 'auth_token': auth_token
             }
             return Response(json.dumps(responseObject), 200, mimetype="application/json")
-        if vuln:  # Password Enumeration
-            if user and request_data.get('password') != user.password:
-                return Response(error_message_helper("Password is not correct for the given username."), 200,
-                                mimetype="application/json")
-            elif not user:  # User enumeration
-                return Response(error_message_helper("Username does not exist"), 200, mimetype="application/json")
-        else:
-            if (user and request_data.get('password') != user.password) or (not user):
-                return Response(error_message_helper("Username or Password Incorrect!"), 200,
-                                mimetype="application/json")
+        # unknown user and wrong password get the exact same generic answer (no enumeration)
+        if _register_failed_login(request_data.get('username')):
+            return Response(error_message_helper(GENERIC_LOGIN_ERROR), 429, mimetype="application/json")
+        return Response(error_message_helper(GENERIC_LOGIN_ERROR), 200, mimetype="application/json")
     except jsonschema.exceptions.ValidationError as exc:
         return Response(error_message_helper(exc.message), 400, mimetype="application/json")
     except:
@@ -140,40 +152,22 @@ def update_email(username):
         return Response(error_message_helper(resp), 401, mimetype="application/json")
     else:
         user = User.query.filter_by(username=resp['sub']).first()
-        if vuln:  # Regex DoS
-            match = re.search(
-                r"^([0-9a-zA-Z]([-.\w]*[0-9a-zA-Z])*@{1}([0-9a-zA-Z][-\w]*[0-9a-zA-Z]\.)+[a-zA-Z]{2,9})$",
-                str(request_data.get('email')))
-            if match:
-                user.email = request_data.get('email')
-                db.session.commit()
-                responseObject = {
-                    'status': 'success',
-                    'data': {
-                        'username': user.username,
-                        'email': user.email
-                    }
+        email = str(request_data.get('email'))
+        # linear-time email check: bounded length and no nested quantifiers (no catastrophic backtracking)
+        if len(email) <= 254 and re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,24}", email):
+            user.email = email
+            db.session.commit()
+            responseObject = {
+                'status': 'success',
+                'data': {
+                    'username': user.username,
+                    'email': user.email
                 }
-                return Response(json.dumps(responseObject), 204, mimetype="application/json")
-            else:
-                return Response(error_message_helper("Please Provide a valid email address."), 400,
-                                mimetype="application/json")
+            }
+            return Response(json.dumps(responseObject), 204, mimetype="application/json")
         else:
-            regex = '^[a-z0-9]+[\._]?[a-z0-9]+[@]\w+[.]\w{2,3}$'
-            if (re.search(regex, request_data.get('email'))):
-                user.email = request_data.get('email')
-                db.session.commit()
-                responseObject = {
-                    'status': 'success',
-                    'data': {
-                        'username': user.username,
-                        'email': user.email
-                    }
-                }
-                return Response(json.dumps(responseObject), 204, mimetype="application/json")
-            else:
-                return Response(error_message_helper("Please Provide a valid email address."), 400,
-                                mimetype="application/json")
+            return Response(error_message_helper("Please Provide a valid email address."), 400,
+                            mimetype="application/json")
 
 
 def update_password(username):
@@ -183,17 +177,16 @@ def update_password(username):
         return Response(error_message_helper(resp), 401, mimetype="application/json")
     else:
         if request_data.get('password'):
-            if vuln:  # Unauthorized update of password of another user
-                user = User.query.filter_by(username=username).first()
-                if user:
-                    user.password = request_data.get('password')
-                    db.session.commit()
-                else:
-                    return Response(error_message_helper("User Not Found"), 400, mimetype="application/json")
-            else:
-                user = User.query.filter_by(username=resp['sub']).first()
-                user.password = request_data.get('password')
-                db.session.commit()
+            # a user may only change their OWN password; a request for anyone else is refused
+            # (and nothing is changed, not even the caller's own password)
+            if username != resp['sub']:
+                return Response(error_message_helper("You can only change your own password."), 403,
+                                mimetype="application/json")
+            user = User.query.filter_by(username=resp['sub']).first()
+            if not user:
+                return Response(error_message_helper("User Not Found"), 400, mimetype="application/json")
+            user.password = request_data.get('password')
+            db.session.commit()
             responseObject = {
                 'status': 'success',
                 'Password': 'Updated.'
