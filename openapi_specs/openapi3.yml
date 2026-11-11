@@ -87,6 +87,8 @@ paths:
                           example: 'name1'
   /users/v1/_debug:
     get:
+      security:
+        - bearerAuth: [ ]
       tags:
         - users
       summary: Retrieves all details for all users
@@ -111,9 +113,6 @@ paths:
                         email:
                           type: string
                           example: 'mail1@mail.com'
-                        password:
-                          type: string
-                          example: 'pass1'
                         username:
                           type: string
                           example: 'name1'
